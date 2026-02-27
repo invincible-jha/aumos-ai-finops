@@ -7,7 +7,7 @@ SQLAlchemy, Kafka, or external cost providers.
 
 import uuid
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from aumos_ai_finops.core.models import (
     Budget,
@@ -272,4 +272,216 @@ class IFinOpsEventPublisher(Protocol):
         total_ai_cost_usd: float,
     ) -> None:
         """Publish finops.roi_calculated event after an ROI calculation completes."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Interfaces for domain-specific analytics adapters
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ICostForecaster(Protocol):
+    """Interface for AI cost trend analysis and forward-looking projections."""
+
+    async def analyze_cost_trends(
+        self,
+        tenant_id: str,
+        cost_history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Analyse historical cost data to identify trends, velocity, and patterns.
+
+        Args:
+            tenant_id: Tenant for which to analyse costs.
+            cost_history: List of period cost records with period_label and total_cost_usd.
+
+        Returns:
+            Dict with slope, r_squared, trend_direction, and period_summaries.
+        """
+        ...
+
+    async def project_costs(
+        self,
+        tenant_id: str,
+        cost_history: list[dict[str, Any]],
+        projection_periods: int,
+        method: str,
+    ) -> dict[str, Any]:
+        """Project future costs using linear or exponential extrapolation.
+
+        Args:
+            tenant_id: Tenant for which to project costs.
+            cost_history: Historical cost records.
+            projection_periods: Number of periods to project forward.
+            method: Projection method: linear | exponential.
+
+        Returns:
+            Dict with projected_periods (list of period/cost pairs) and
+            confidence_band.
+        """
+        ...
+
+    async def detect_seasonal_patterns(
+        self,
+        tenant_id: str,
+        cost_history: list[dict[str, Any]],
+        period_type: str,
+    ) -> dict[str, Any]:
+        """Detect recurring seasonal patterns in cost data.
+
+        Args:
+            tenant_id: Tenant for which to detect patterns.
+            cost_history: Historical cost records.
+            period_type: Seasonality period: weekly | monthly | quarterly.
+
+        Returns:
+            Dict with seasonal_indices, peak_periods, and pattern_strength.
+        """
+        ...
+
+    async def compare_budget_vs_actual(
+        self,
+        tenant_id: str,
+        budget_periods: list[dict[str, Any]],
+        actual_costs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compare budgeted vs actual costs and compute variance metrics.
+
+        Args:
+            tenant_id: Tenant for budget comparison.
+            budget_periods: List of periods with budget_usd per period.
+            actual_costs: List of periods with actual_cost_usd per period.
+
+        Returns:
+            Dict with variance_by_period, cumulative_variance, and
+            avg_variance_percent.
+        """
+        ...
+
+    async def predict_budget_exhaustion(
+        self,
+        tenant_id: str,
+        remaining_budget_usd: float,
+        current_spend_rate_usd_per_day: float,
+        spend_acceleration: float,
+    ) -> dict[str, Any]:
+        """Predict when the remaining budget will be exhausted.
+
+        Args:
+            tenant_id: Tenant for the prediction.
+            remaining_budget_usd: Remaining budget in USD.
+            current_spend_rate_usd_per_day: Current daily spend rate.
+            spend_acceleration: Daily rate of change in spend (can be negative).
+
+        Returns:
+            Dict with exhaustion_days, exhaustion_date, and confidence.
+        """
+        ...
+
+    async def detect_cost_anomalies(
+        self,
+        tenant_id: str,
+        cost_history: list[dict[str, Any]],
+        z_score_threshold: float,
+    ) -> dict[str, Any]:
+        """Detect anomalous cost spikes using Z-score analysis.
+
+        Args:
+            tenant_id: Tenant for anomaly detection.
+            cost_history: Historical cost records.
+            z_score_threshold: Z-score above which a period is flagged.
+
+        Returns:
+            Dict with anomalies (list of flagged periods) and anomaly_count.
+        """
+        ...
+
+    async def generate_forecast_report(
+        self,
+        tenant_id: str,
+        cost_history: list[dict[str, Any]],
+        budget_usd: float | None,
+        projection_periods: int,
+    ) -> dict[str, Any]:
+        """Generate a comprehensive cost forecast report.
+
+        Args:
+            tenant_id: Tenant for the report.
+            cost_history: Historical cost records.
+            budget_usd: Optional total budget for exhaustion analysis.
+            projection_periods: Periods to project forward.
+
+        Returns:
+            Complete forecast report dict with trends, projections, anomalies,
+            and budget health assessment.
+        """
+        ...
+
+
+@runtime_checkable
+class IInvoiceGenerator(Protocol):
+    """Interface for per-tenant invoice compilation and reconciliation."""
+
+    async def compile_tenant_invoice(
+        self,
+        tenant_id: str,
+        billing_period_start: datetime,
+        billing_period_end: datetime,
+        cost_records: list[Any],
+        token_usage_records: list[Any],
+        tax_jurisdiction: str,
+        payment_terms_days: int,
+    ) -> dict[str, Any]:
+        """Compile a complete invoice for a tenant covering a billing period.
+
+        Args:
+            tenant_id: Tenant for which to generate the invoice.
+            billing_period_start: Inclusive start of the billing period.
+            billing_period_end: Inclusive end of the billing period.
+            cost_records: List of CostRecord objects or equivalent dicts.
+            token_usage_records: List of TokenUsage objects or equivalent dicts.
+            tax_jurisdiction: ISO country code for tax rate lookup.
+            payment_terms_days: Net payment terms in days.
+
+        Returns:
+            Invoice dict with line_items, subtotal, tax, total, and metadata.
+        """
+        ...
+
+    async def generate_pdf_invoice_data(
+        self,
+        invoice: dict[str, Any],
+        company_details: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Produce a structured payload suitable for PDF invoice rendering.
+
+        Args:
+            invoice: Compiled invoice dict from compile_tenant_invoice.
+            company_details: Billing company name, address, and logo URL.
+
+        Returns:
+            PDF-ready invoice data dict with formatted currency, layout hints,
+            and QR code data for payment.
+        """
+        ...
+
+    async def reconcile_with_provider_bill(
+        self,
+        tenant_id: str,
+        internal_invoice: dict[str, Any],
+        provider_bill: dict[str, Any],
+        tolerance_percent: float,
+    ) -> dict[str, Any]:
+        """Reconcile the internal invoice against a provider bill.
+
+        Args:
+            tenant_id: Tenant for the reconciliation.
+            internal_invoice: Invoice from compile_tenant_invoice.
+            provider_bill: Provider bill dict with line_items and total.
+            tolerance_percent: Acceptable variance percent before flagging.
+
+        Returns:
+            Reconciliation report with matched_items, unmatched_items,
+            variance_usd, and reconciliation_status.
+        """
         ...

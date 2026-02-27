@@ -22,8 +22,10 @@ from aumos_common.observability import get_logger
 from aumos_ai_finops.core.interfaces import (
     IBudgetAlertRepository,
     IBudgetRepository,
+    ICostForecaster,
     ICostRecordRepository,
     IFinOpsEventPublisher,
+    IInvoiceGenerator,
     IKubeCostClient,
     IOpenCostClient,
     IROICalculationRepository,
@@ -978,3 +980,296 @@ class RoutingOptimizerService:
         )
 
         return persisted
+
+
+class CostForecastService:
+    """Provide cost trend analysis, projections, anomaly detection, and forecasting.
+
+    Orchestrates ICostForecaster to produce insight reports from historical
+    cost data without requiring direct repository access in the adapter layer.
+    """
+
+    def __init__(
+        self,
+        cost_repo: ICostRecordRepository,
+        token_repo: ITokenUsageRepository,
+        forecaster: ICostForecaster,
+        settings: Settings,
+    ) -> None:
+        """Initialize CostForecastService with required dependencies.
+
+        Args:
+            cost_repo: Cost record repository for historical data retrieval.
+            token_repo: Token usage repository for token cost data.
+            forecaster: Cost forecasting adapter.
+            settings: Service settings with thresholds and defaults.
+        """
+        self._cost_repo = cost_repo
+        self._token_repo = token_repo
+        self._forecaster = forecaster
+        self._settings = settings
+
+    async def generate_cost_forecast_report(
+        self,
+        tenant_id: str,
+        period_start: datetime,
+        period_end: datetime,
+        projection_periods: int = 3,
+        budget_usd: float | None = None,
+    ) -> dict[str, Any]:
+        """Generate a comprehensive cost forecast report from historical data.
+
+        Pulls cost and token records for the period, builds a cost history
+        timeline, then delegates to ICostForecaster for analysis and projections.
+
+        Args:
+            tenant_id: Tenant for which to generate the report.
+            period_start: Start of the historical window.
+            period_end: End of the historical window.
+            projection_periods: Number of forward periods to project.
+            budget_usd: Optional total budget for exhaustion analysis.
+
+        Returns:
+            Complete forecast report dict with trends, projections, anomalies,
+            and budget health summary.
+        """
+        cost_records = await self._cost_repo.list_by_tenant_period(
+            tenant_id=tenant_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        token_records = await self._token_repo.list_by_tenant_period(
+            tenant_id=tenant_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+
+        # Build a unified cost history timeline (monthly buckets)
+        cost_history = _build_cost_history(cost_records, token_records)
+
+        report = await self._forecaster.generate_forecast_report(
+            tenant_id=tenant_id,
+            cost_history=cost_history,
+            budget_usd=budget_usd,
+            projection_periods=projection_periods,
+        )
+
+        logger.info(
+            "cost_forecast_report_generated",
+            tenant_id=tenant_id,
+            period_start=period_start.isoformat(),
+            period_end=period_end.isoformat(),
+            projection_periods=projection_periods,
+            history_data_points=len(cost_history),
+        )
+
+        return report
+
+    async def detect_anomalies(
+        self,
+        tenant_id: str,
+        period_start: datetime,
+        period_end: datetime,
+        z_score_threshold: float = 2.5,
+    ) -> dict[str, Any]:
+        """Detect anomalous cost spikes in the historical period.
+
+        Args:
+            tenant_id: Tenant for anomaly detection.
+            period_start: Start of the historical window.
+            period_end: End of the historical window.
+            z_score_threshold: Z-score above which a period is flagged (default 2.5).
+
+        Returns:
+            Dict with anomalies list and anomaly_count.
+        """
+        cost_records = await self._cost_repo.list_by_tenant_period(
+            tenant_id=tenant_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        token_records = await self._token_repo.list_by_tenant_period(
+            tenant_id=tenant_id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        cost_history = _build_cost_history(cost_records, token_records)
+
+        result = await self._forecaster.detect_cost_anomalies(
+            tenant_id=tenant_id,
+            cost_history=cost_history,
+            z_score_threshold=z_score_threshold,
+        )
+
+        logger.info(
+            "cost_anomaly_detection_completed",
+            tenant_id=tenant_id,
+            anomaly_count=result.get("anomaly_count", 0),
+            z_score_threshold=z_score_threshold,
+        )
+
+        return result
+
+
+class InvoiceService:
+    """Compile and manage per-tenant invoices and provider bill reconciliation.
+
+    Orchestrates IInvoiceGenerator to produce structured invoice documents
+    and reconciliation reports against provider billing data.
+    """
+
+    def __init__(
+        self,
+        cost_repo: ICostRecordRepository,
+        token_repo: ITokenUsageRepository,
+        invoice_generator: IInvoiceGenerator,
+        event_publisher: IFinOpsEventPublisher,
+        settings: Settings,
+    ) -> None:
+        """Initialize InvoiceService with required dependencies.
+
+        Args:
+            cost_repo: Cost record repository for billing period data.
+            token_repo: Token usage repository for token billing data.
+            invoice_generator: Invoice compilation adapter.
+            event_publisher: FinOps event publisher.
+            settings: Service settings.
+        """
+        self._cost_repo = cost_repo
+        self._token_repo = token_repo
+        self._invoice_generator = invoice_generator
+        self._publisher = event_publisher
+        self._settings = settings
+
+    async def generate_invoice(
+        self,
+        tenant_id: str,
+        billing_period_start: datetime,
+        billing_period_end: datetime,
+        tax_jurisdiction: str = "US",
+        payment_terms_days: int = 30,
+    ) -> dict[str, Any]:
+        """Generate a complete invoice for a tenant billing period.
+
+        Pulls all cost and token records for the period and delegates
+        compilation to IInvoiceGenerator.
+
+        Args:
+            tenant_id: Tenant for which to generate the invoice.
+            billing_period_start: Inclusive start of the billing period.
+            billing_period_end: Inclusive end of the billing period.
+            tax_jurisdiction: ISO country code for tax rate lookup (default US).
+            payment_terms_days: Net payment terms in days (default 30).
+
+        Returns:
+            Complete invoice dict with line items, totals, and metadata.
+        """
+        cost_records = await self._cost_repo.list_by_tenant_period(
+            tenant_id=tenant_id,
+            period_start=billing_period_start,
+            period_end=billing_period_end,
+        )
+        token_records = await self._token_repo.list_by_tenant_period(
+            tenant_id=tenant_id,
+            period_start=billing_period_start,
+            period_end=billing_period_end,
+        )
+
+        invoice = await self._invoice_generator.compile_tenant_invoice(
+            tenant_id=tenant_id,
+            billing_period_start=billing_period_start,
+            billing_period_end=billing_period_end,
+            cost_records=cost_records,
+            token_usage_records=token_records,
+            tax_jurisdiction=tax_jurisdiction,
+            payment_terms_days=payment_terms_days,
+        )
+
+        logger.info(
+            "invoice_generated",
+            tenant_id=tenant_id,
+            invoice_number=invoice.get("invoice_number", ""),
+            total_usd=invoice.get("total_usd", 0.0),
+            billing_period_start=billing_period_start.isoformat(),
+            billing_period_end=billing_period_end.isoformat(),
+        )
+
+        return invoice
+
+    async def reconcile_with_provider(
+        self,
+        tenant_id: str,
+        internal_invoice: dict[str, Any],
+        provider_bill: dict[str, Any],
+        tolerance_percent: float = 2.0,
+    ) -> dict[str, Any]:
+        """Reconcile an internal invoice against a provider bill.
+
+        Args:
+            tenant_id: Tenant for the reconciliation.
+            internal_invoice: Invoice from generate_invoice.
+            provider_bill: Provider bill dict with line_items and total.
+            tolerance_percent: Acceptable variance percent (default 2.0%).
+
+        Returns:
+            Reconciliation report with matched items, variances, and status.
+        """
+        result = await self._invoice_generator.reconcile_with_provider_bill(
+            tenant_id=tenant_id,
+            internal_invoice=internal_invoice,
+            provider_bill=provider_bill,
+            tolerance_percent=tolerance_percent,
+        )
+
+        logger.info(
+            "invoice_reconciliation_completed",
+            tenant_id=tenant_id,
+            reconciliation_status=result.get("reconciliation_status", "unknown"),
+            variance_usd=result.get("variance_usd", 0.0),
+            tolerance_percent=tolerance_percent,
+        )
+
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_cost_history(
+    cost_records: list[Any],
+    token_records: list[Any],
+) -> list[dict[str, Any]]:
+    """Aggregate cost and token records into monthly cost history buckets.
+
+    Args:
+        cost_records: List of CostRecord objects with period_start and cost_usd.
+        token_records: List of TokenUsage objects with period_start and total_cost_usd.
+
+    Returns:
+        List of monthly cost dicts with period_label and total_cost_usd,
+        sorted by period_label ascending.
+    """
+    from collections import defaultdict
+
+    monthly_totals: dict[str, float] = defaultdict(float)
+
+    for record in cost_records:
+        period_start = getattr(record, "period_start", None)
+        cost_usd = getattr(record, "cost_usd", 0.0) or 0.0
+        if period_start is not None:
+            period_key = period_start.strftime("%Y-%m")
+            monthly_totals[period_key] += float(cost_usd)
+
+    for record in token_records:
+        period_start = getattr(record, "period_start", None)
+        total_cost_usd = getattr(record, "total_cost_usd", 0.0) or 0.0
+        if period_start is not None:
+            period_key = period_start.strftime("%Y-%m")
+            monthly_totals[period_key] += float(total_cost_usd)
+
+    return [
+        {"period_label": period, "total_cost_usd": round(total, 6)}
+        for period, total in sorted(monthly_totals.items())
+    ]
