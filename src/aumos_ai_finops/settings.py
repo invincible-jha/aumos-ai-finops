@@ -46,4 +46,7 @@ class Settings(AumOSSettings):
     routing_quality_weight: float = 0.4    # Weight for quality objective
     routing_latency_weight: float = 0.2    # Weight for latency objective
 
+    # Budget enforcement
+    enable_hard_budget_caps: bool = False  # When True, hard-cap requests that would exceed budget
+
     model_config = SettingsConfigDict(env_prefix="AUMOS_FINOPS_")

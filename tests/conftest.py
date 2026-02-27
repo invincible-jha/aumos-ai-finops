@@ -1,5 +1,13 @@
 """Shared test fixtures for aumos-ai-finops tests."""
 
+import sys
+from pathlib import Path
+
+# Ensure the src/ layout is importable without installing the package.
+_SRC_PATH = Path(__file__).parent.parent / "src"
+if str(_SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(_SRC_PATH))
+
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator

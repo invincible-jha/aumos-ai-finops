@@ -10,18 +10,26 @@ Domain model:
   Budget                 — Per-tenant budget thresholds with alert config
   BudgetAlert            — Triggered budget alerts (warning and critical)
   RoutingRecommendation  — Cost-optimized model routing suggestions
+
+P0.2 chargeback models:
+  CostAllocation         — Aggregated cost allocated to a team/project per period
+  BudgetLimit            — Configurable spend limits with hard-cap enforcement
 """
+from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -638,4 +646,389 @@ class RoutingRecommendation(AumOSModel):
 
     __table_args__ = (
         Index("ix_fin_routing_tenant_workload", "tenant_id", "workload_name"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# P0.2 Chargeback models
+# ---------------------------------------------------------------------------
+
+
+class CostAllocation(AumOSModel):
+    """Aggregated AI cost allocation for a team and project within a period.
+
+    Records rolled-up token, inference, and storage costs to support per-team
+    chargeback reporting and multi-period trend analysis.
+
+    Table: fin_cost_allocations
+    """
+
+    __tablename__ = "fin_cost_allocations"
+
+    # Scope identifiers
+    team_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Team identifier within the tenant",
+    )
+    project_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Project identifier within the team",
+    )
+
+    # Billing period
+    period_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+        comment="Start of the cost allocation period (UTC)",
+    )
+    period_end: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="End of the cost allocation period (UTC)",
+    )
+
+    # Service and model classification
+    service: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="Service that incurred the cost (e.g., aumos-llm-serving)",
+    )
+    model_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default="",
+        comment="Model identifier (e.g., gpt-4o, claude-opus-4, or empty for non-LLM costs)",
+    )
+
+    # Token counters (LLM costs)
+    total_input_tokens: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        comment="Total prompt/input tokens consumed in this period",
+    )
+    total_output_tokens: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        comment="Total completion/output tokens generated in this period",
+    )
+    total_cost_usd: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+        comment="Total allocated cost in USD for this period",
+    )
+
+    # Non-token cost components
+    inference_minutes: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+        comment="Total compute time in minutes for inference (non-token compute charges)",
+    )
+    storage_gb_days: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=0.0,
+        comment="Storage consumed in GB-days (vector stores, model artifacts, etc.)",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "team_id",
+            "project_id",
+            "service",
+            "model_id",
+            "period_start",
+            name="uq_fin_cost_allocations_scope_period",
+        ),
+        Index(
+            "ix_fin_cost_allocations_tenant_team_period",
+            "tenant_id",
+            "team_id",
+            "period_start",
+        ),
+        Index(
+            "ix_fin_cost_allocations_tenant_project_period",
+            "tenant_id",
+            "project_id",
+            "period_start",
+        ),
+    )
+
+
+class BudgetLimit(AumOSModel):
+    """A spending limit for a tenant/team combination with alerting configuration.
+
+    Supports monthly, quarterly, and annual periods. When actual spend crosses
+    the alert threshold, a warning event is emitted. When hard_cap is enabled
+    and the limit is reached, requests that would exceed the budget are blocked.
+
+    Table: fin_budget_limits
+    """
+
+    __tablename__ = "fin_budget_limits"
+
+    # Scope — team_id is optional to allow tenant-wide limits
+    team_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+        comment="Team scope for this limit (null = applies to entire tenant)",
+    )
+
+    # Period type
+    period_type: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="monthly",
+        comment="Billing period granularity: monthly | quarterly | annual",
+    )
+
+    # Limit configuration
+    limit_usd: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        comment="Maximum allowed spend in USD for the configured period",
+    )
+    alert_threshold_pct: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=80,
+        comment="Percentage of limit that triggers a warning alert (e.g., 80 = 80%)",
+    )
+    hard_cap: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="When True, block requests that would cause spend to exceed limit_usd",
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Whether this budget limit is actively enforced",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "team_id",
+            "period_type",
+            name="uq_fin_budget_limits_tenant_team_period",
+        ),
+        Index("ix_fin_budget_limits_tenant_active", "tenant_id", "is_active"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# P3.1 Cost-to-Outcome Attribution models
+# ---------------------------------------------------------------------------
+
+
+class CostOutcomeAttribution(AumOSModel):
+    """Per-decision cost breakdown joined with business outcome for ROI measurement.
+
+    Records the six cost components for every AI decision and, once attributed,
+    the business outcome value and computed ROI. The 90-day attribution window
+    is enforced at the service layer.
+
+    All monetary columns use DECIMAL(18,6) for precision — never Float.
+
+    Table: fin_cost_outcome_attributions
+    """
+
+    __tablename__ = "fin_cost_outcome_attributions"
+
+    # Decision identity
+    decision_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        unique=True,
+        index=True,
+        comment="Unique identifier for the AI decision (UUID string from the AI system)",
+    )
+    ai_system_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Identifier of the AI system that produced the decision",
+    )
+    use_case: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Business use case label (e.g., fraud_detection, claims_triage)",
+    )
+    decision_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+        comment="Timestamp when the AI decision was made (UTC)",
+    )
+
+    # Six cost components (USD, DECIMAL for precision)
+    input_token_cost: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Cost of prompt/input tokens in USD",
+    )
+    output_token_cost: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Cost of completion/output tokens in USD",
+    )
+    compute_cost: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="GPU/CPU compute cost during inference in USD",
+    )
+    storage_cost: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Storage cost attributed to this decision in USD",
+    )
+    egress_cost: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Network egress cost for delivering the response in USD",
+    )
+    human_review_cost: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Human review cost if a human reviewed this decision in USD (0 if no review)",
+    )
+
+    # Derived total (sum of all six components)
+    total_cost_usd: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Sum of all six cost components in USD",
+    )
+
+    # Business outcome (populated when attribution is complete)
+    outcome_type: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        index=True,
+        comment="Categorical outcome type (e.g., revenue_generated, cost_saved, risk_avoided)",
+    )
+    outcome_value_usd: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 6),
+        nullable=True,
+        comment="Monetized business outcome value in USD",
+    )
+    roi_pct: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 4),
+        nullable=True,
+        comment="ROI = (outcome_value - total_cost) / total_cost * 100",
+    )
+    attribution_complete: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        index=True,
+        comment="True once an outcome has been matched to this decision",
+    )
+    outcome_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp when the business outcome was realized (UTC)",
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_fin_coa_tenant_use_case_decision",
+            "tenant_id",
+            "use_case",
+            "decision_at",
+        ),
+        Index(
+            "ix_fin_coa_tenant_complete",
+            "tenant_id",
+            "attribution_complete",
+        ),
+    )
+
+
+class ROISummary(AumOSModel):
+    """Aggregated ROI summary for a use case over a reporting period.
+
+    Pre-aggregated to support fast dashboard queries without scanning
+    individual attribution records. Refreshed daily by a background job.
+
+    Table: fin_roi_summaries
+    """
+
+    __tablename__ = "fin_roi_summaries"
+
+    use_case: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Business use case this summary covers",
+    )
+    period_date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+        comment="Date of this summary record (UTC, truncated to day)",
+    )
+    total_decisions: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Total AI decisions processed for this use case in this period",
+    )
+    total_cost_usd: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Sum of all decision costs for this use case and period",
+    )
+    total_outcome_value_usd: Mapped[Decimal] = mapped_column(
+        Numeric(18, 6),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Sum of all attributed outcome values for this use case and period",
+    )
+    avg_roi_pct: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4),
+        nullable=False,
+        default=Decimal("0"),
+        comment="Average ROI across decisions that have attributed outcomes",
+    )
+    decisions_with_outcome: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Count of decisions that have a matched outcome",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "use_case",
+            "period_date",
+            name="uq_fin_roi_summaries_tenant_usecase_period",
+        ),
+        Index(
+            "ix_fin_roi_summaries_tenant_period",
+            "tenant_id",
+            "period_date",
+        ),
     )

@@ -40,5 +40,7 @@ app = create_app(
 )
 
 from aumos_ai_finops.api.router import router  # noqa: E402
+from aumos_ai_finops.api.routes.attribution import router as attribution_router  # noqa: E402
 
 app.include_router(router, prefix="/api/v1")
+app.include_router(attribution_router, prefix="/api/v1")
